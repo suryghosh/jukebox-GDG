@@ -1,115 +1,108 @@
-"""
-Get alignment from attn values
-1. run a forward pass on each hop, get attn values
-2. concat for all hops
-"""
+import librosa
+import json
+import math
 import numpy as np
-import torch as t
-from jukebox.utils.torch_utils import assert_shape, empty_cache
-from jukebox.hparams import Hyperparams
-from jukebox.make_models import make_model
-from jukebox.save_html import save_html
-from jukebox.utils.sample_utils import get_starts
-import fire
+import jukebox.utils.dist_adapter as dist
+from torch.utils.data import Dataset
+from jukebox.utils.dist_utils import print_all
+from jukebox.utils.io import get_duration_sec, load_audio
+from jukebox.data.labels import Labeller
 
-def get_alignment(x, zs, labels, prior, fp16, hps):
-    level = hps.levels - 1 # Top level used
-    n_ctx, n_tokens = prior.n_ctx, prior.n_tokens
-    z = zs[level]
-    bs, total_length = z.shape[0], z.shape[1]
-    if total_length < n_ctx:
-        padding_length = n_ctx - total_length
-        z = t.cat([z, t.zeros(bs, n_ctx - total_length, dtype=z.dtype, device=z.device)], dim=1)
-        total_length = z.shape[1]
-    else:
-        padding_length = 0
+class FilesAudioDataset(Dataset):
+    def __init__(self, hps):
+        super().__init__()
+        self.sr = hps.sr
+        self.channels = hps.channels
+        self.min_duration = hps.min_duration or math.ceil(hps.sample_length / hps.sr)
+        self.max_duration = hps.max_duration or math.inf
+        self.sample_length = hps.sample_length
+        assert hps.sample_length / hps.sr < self.min_duration, f'Sample length {hps.sample_length} per sr {hps.sr} ({hps.sample_length / hps.sr:.2f}) should be shorter than min duration {self.min_duration}'
+        self.aug_shift = hps.aug_shift
+        self.labels = hps.labels
+        self.metadata = self.load_metadata("F:\\GDG\\jukebox-GDG\\jukebox\\metadata.json")  # 🔹 Load metadata
+        self.init_dataset(hps)
 
-    hop_length = int(hps.hop_fraction[level]*prior.n_ctx)
-    n_head = prior.prior.transformer.n_head
-    alignment_head, alignment_layer = prior.alignment_head, prior.alignment_layer
-    attn_layers = set([alignment_layer])
-    alignment_hops = {}
-    indices_hops = {}
+    def load_metadata(self, metadata_file):
+        """Loads metadata from a JSON file."""
+        try:
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print_all(f"Metadata file {metadata_file} not found. Using empty metadata.")
+            return {}
+        except json.JSONDecodeError:
+            print_all(f"Error decoding JSON from {metadata_file}. Using empty metadata.")
+            return {}
 
-    prior.cuda()
-    empty_cache()
-    for start in get_starts(total_length, n_ctx, hop_length):
-        end = start + n_ctx
+    def filter(self, files, durations):
+        keep = []
+        for i in range(len(files)):
+            if durations[i] / self.sr < self.min_duration:
+                continue
+            if durations[i] / self.sr >= self.max_duration:
+                continue
+            keep.append(i)
+        print_all(f'self.sr={self.sr}, min: {self.min_duration}, max: {self.max_duration}')
+        print_all(f"Keeping {len(keep)} of {len(files)} files")
+        self.files = [files[i] for i in keep]
+        self.durations = [int(durations[i]) for i in keep]
+        self.cumsum = np.cumsum(self.durations)
 
-        # set y offset, sample_length and lyrics tokens
-        y, indices_hop = prior.get_y(labels, start, get_indices=True)
-        assert len(indices_hop) == bs
-        for indices in indices_hop:
-            assert len(indices) == n_tokens
+    def init_dataset(self, hps):
+        files = librosa.util.find_files(f'{hps.audio_files_dir}', ['mp3', 'opus', 'm4a', 'aac', 'wav'])
+        print_all(f"Found {len(files)} files. Getting durations")
+        cache = dist.get_rank() % 8 == 0 if dist.is_available() else True
+        durations = np.array([get_duration_sec(file, cache=cache) * self.sr for file in files])
+        self.filter(files, durations)
 
-        z_bs = t.chunk(z, bs, dim=0)
-        y_bs = t.chunk(y, bs, dim=0)
-        w_hops = []
-        for z_i, y_i in zip(z_bs, y_bs):
-            w_hop = prior.z_forward(z_i[:,start:end], [], y_i, fp16=fp16, get_attn_weights=attn_layers)
-            assert len(w_hop) == 1
-            w_hops.append(w_hop[0][:, alignment_head])
-            del w_hop
-        w = t.cat(w_hops, dim=0)
-        del w_hops
-        assert_shape(w, (bs, n_ctx, n_tokens))
-        alignment_hop = w.float().cpu().numpy()
-        assert_shape(alignment_hop, (bs, n_ctx, n_tokens))
-        del w
+        if self.labels:
+            self.labeller = Labeller(hps.max_bow_genre_size, hps.n_tokens, self.sample_length, v3=hps.labels_v3)
 
-        # alignment_hop has shape (bs, n_ctx, n_tokens)
-        # indices_hop is a list of len=bs, each entry of len hps.n_tokens
-        indices_hops[start] = indices_hop
-        alignment_hops[start] = alignment_hop
-    prior.cpu()
-    empty_cache()
+    def get_index_offset(self, item):
+        half_interval = self.sample_length // 2
+        shift = np.random.randint(-half_interval, half_interval) if self.aug_shift else 0
+        offset = item * self.sample_length + shift
+        midpoint = offset + half_interval
+        assert 0 <= midpoint < self.cumsum[-1], f'Midpoint {midpoint} of item beyond total length {self.cumsum[-1]}'
+        index = np.searchsorted(self.cumsum, midpoint)
+        start, end = self.cumsum[index - 1] if index > 0 else 0.0, self.cumsum[index]
+        assert start <= midpoint <= end, f"Midpoint {midpoint} not inside interval [{start}, {end}] for index {index}"
+        if offset > end - self.sample_length:
+            offset = max(start, offset - half_interval)
+        elif offset < start:
+            offset = min(end - self.sample_length, offset + half_interval)
+        assert start <= offset <= end - self.sample_length, f"Offset {offset} not in [{start}, {end - self.sample_length}]. End: {end}, SL: {self.sample_length}, Index: {index}"
+        offset = offset - start
+        return index, offset
 
-    # Combine attn for each hop into attn for full range
-    # Use indices to place them into correct place for corresponding source tokens
-    alignments = []
-    for item in range(bs):
-        # Note each item has different length lyrics
-        full_tokens = labels['info'][item]['full_tokens']
-        alignment = np.zeros((total_length, len(full_tokens) + 1))
-        for start in reversed(get_starts(total_length, n_ctx, hop_length)):
-            end = start + n_ctx
-            alignment_hop = alignment_hops[start][item]
-            indices = indices_hops[start][item]
-            assert len(indices) == n_tokens
-            assert alignment_hop.shape == (n_ctx, n_tokens)
-            alignment[start:end,indices] = alignment_hop
-        alignment = alignment[:total_length - padding_length,:-1] # remove token padding, and last lyric index
-        alignments.append(alignment)
-    return alignments
+    def get_metadata(self, filename):
+        """Gets metadata for a given filename."""
+        metadata = self.metadata.get(filename, {})
+        thaat = metadata.get("thaat", "unknown")
+        sub_thaat = metadata.get("sub-thaat", "unknown")
+        song = metadata.get("song", "unknown")
+        index = metadata.get("index", -1)
+        return thaat, sub_thaat, song, index
 
-def save_alignment(model, device, hps):
-    print(hps)
-    vqvae, priors = make_model(model, device, hps, levels=[-1])
+    def get_song_chunk(self, index, offset, test=False):
+        filename, total_length = self.files[index], self.durations[index]
+        data, sr = load_audio(filename, sr=self.sr, offset=offset, duration=self.sample_length)
+        assert data.shape == (self.channels, self.sample_length), f'Expected {(self.channels, self.sample_length)}, got {data.shape}'
+        
+        thaat, sub_thaat, song, song_index = self.get_metadata(filename)  # 🔹 Get metadata
+        
+        if self.labels:
+            labels = self.labeller.get_label(thaat, sub_thaat, song, total_length, offset)
+            return data.T, labels['y'], filename, thaat, sub_thaat, song, song_index  # 🔹 Return metadata
+        else:
+            return data.T, filename, thaat, sub_thaat, song, song_index  # 🔹 Return metadata
 
-    logdir = f"{hps.logdir}/level_{0}"
-    data = t.load(f"{logdir}/data.pth.tar")
-    if model == '1b_lyrics':
-        fp16 = False
-    else:
-        fp16 = True
+    def get_item(self, item, test=False):
+        index, offset = self.get_index_offset(item)
+        return self.get_song_chunk(index, offset, test)
 
-    data['alignments'] = get_alignment(data['x'], data['zs'], data['labels'][-1], priors[-1], fp16, hps)
-    t.save(data, f"{logdir}/data_align.pth.tar")
-    save_html(logdir, data['x'], data['zs'], data['labels'][-1], data['alignments'], hps)
+    def __len__(self):
+        return int(np.floor(self.cumsum[-1] / self.sample_length))
 
-def run(model, port=29500, **kwargs):
-    from jukebox.utils.dist_utils import setup_dist_from_mpi
-    rank, local_rank, device = setup_dist_from_mpi(port=port)
-    hps = Hyperparams(**kwargs)
-
-    with t.no_grad():
-        save_alignment(model, device, hps)
-
-if __name__ == '__main__':
-    fire.Fire(run)
-
-
-
-
-
-
+    def __getitem__(self, item):
+        return self.get_item(item)  # 🔹 Returns data, filename, and metadata
