@@ -29,7 +29,7 @@ teeny = Hyperparams(
 HPARAMS_REGISTRY["teeny"] = teeny
 
 easy = Hyperparams(
-    sr=22050,
+    sr=16000,
 )
 HPARAMS_REGISTRY["easy"] = easy
 
@@ -58,12 +58,29 @@ vqvae = Hyperparams(
 )
 HPARAMS_REGISTRY["vqvae"] = vqvae
 
+raga_thaat_labels = Hyperparams(
+    raga_vocab=[
+        "Adana", "Asavari", "Darbari", "Desi", "Jaunpuri",
+        "Yaman", "Bhairav", "Bhairavi", "Bihag", "Marwa", "Poorvi", "Todi"
+    ],
+    thaat_vocab=[
+        "Bilaval", "Kalyan", "Bhairav", "Todi", "Asavari",
+        "Kafi", "Marwa", "Poorvi", "Bhairavi", "Khamaj"
+    ],
+    num_ragas=12,  # Update based on actual raga count
+    num_thaats=10,  # Update based on actual thaat count
+)
+
+HPARAMS_REGISTRY["raga_thaat_labels"] = raga_thaat_labels
 labels = Hyperparams(
     y_bins=(120, 4111),
     t_bins=128,
     max_bow_genre_size=5,
     n_vocab=80,
+    labels=["raga", "thaat"],
 )
+
+labels.update(raga_thaat_labels)
 
 upsamplers = Hyperparams(
     n_ctx=8192,
@@ -189,7 +206,7 @@ HPARAMS_REGISTRY["prior_1b_lyrics"] = prior_1b_lyrics
 
 # Small models
 small_vqvae = Hyperparams(
-    sr = 22050,
+    sr = 16000,
     levels = 2,
     downs_t = (5, 3),
     strides_t = (2, 2),
@@ -484,8 +501,9 @@ DEFAULTS["prime_attn_block"] = Hyperparams(
 )
 
 DEFAULTS["opt"] = Hyperparams(
-    epochs=10000,
-    lr=0.0003,
+    epochs=50,
+    lr=3e-5,
+    batch_size=32,
     clip=1.0,
     beta1=0.9,
     beta2=0.999,
