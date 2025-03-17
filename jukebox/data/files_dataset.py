@@ -65,17 +65,15 @@ class FilesAudioDataset(Dataset):
         return index, offset
 
     def get_metadata(self, filename, test):
-        """
-        Insert metadata loading code for your dataset here.
-        If artist/genre labels are different from provided artist/genre lists,
-        update labeller accordingly.
-
-        Returns:
-            (artist, genre, full_lyrics) of type (str, str, str). For
-            example, ("unknown", "classical", "") could be a metadata for a
-            piano piece.
-        """
-        return None, None, None
+        
+        metadata = self.metadata.get(filename, {})
+        thaat = metadata.get("thaat", "unknown")
+        sub_thaat = metadata.get("sub-thaat", "unknown")
+        song = metadata.get("song", "unknown")
+        index = metadata.get("index", -1)
+        return thaat, sub_thaat, song, index
+       
+        
 
     def get_song_chunk(self, index, offset, test=False):
         filename, total_length = self.files[index], self.durations[index]
